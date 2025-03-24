@@ -1,7 +1,7 @@
 import jax.numpy as jnp
 import jax.random as random
 import matplotlib.pyplot as plt
-from jax import vmap, jit, device_put
+from jax import vmap, jit
 from jax.scipy.ndimage import map_coordinates
 
 # Constants
@@ -23,7 +23,7 @@ r = R * jnp.sqrt(random.uniform(key_r, (N_sources,)))
 x0 = r * jnp.cos(theta)
 y0 = r * jnp.sin(theta)
 
-# Sample t0 in (0, τ_max)
+# Sample t0 in (0, t_max)
 t0 = random.uniform(key_t, (N_sources,), minval=0, maxval=t_max)
 
 # Grid setup
@@ -38,50 +38,44 @@ y_flat = y_mesh.ravel()
 
 # Green's function G
 @jit
-def G(t, x, y, x0, y0, t0, kappa_E):
+def G(x, y, x0, y0, t0, t):
     tau = jnp.maximum(t - t0, 1e-6)  # Ensure tau > 0
-    n_values = jnp.arange(-10, 11)  # Reduce n values for speedup
-    zn = 2 * n_values[:, None] * L + (-1) ** n_values[:, None] * z0  # Ensure shape (21,1)
-
-    # Compute exponent term with proper broadcasting
-    exponent = -((x - x0) ** 2 + (y - y0) ** 2 + zn ** 2) / (4 * kappa_E * tau)
-    psi_n = ((-1) ** n_values[:, None] * Q_E / ((4 * jnp.pi * kappa_E * tau) ** (3 / 2))) * jnp.exp(exponent)
-
-    return jnp.sum(psi_n, axis=0)  # Sum over `n` to collapse dimension (21,)
+    n_values = jnp.arange(-50, 51)
+    zn = 2 * n_values[:, None] * L + (-1) ** n_values[:, None] * z0  # Shape (101, 1)
+    
+    # Compute exponent term with broadcasting
+    exponent = -((x - x0) ** 2 + (y - y0) ** 2 + zn ** 2) / (4 * kappa * tau)
+    psi_n = ((-1) ** n_values[:, None] * Q_E / ((4 * jnp.pi * kappa * tau) ** (3 / 2))) * jnp.exp(exponent)
+    
+    return jnp.sum(psi_n, axis=0)  # Sum over `n` to collapse dimension
 
 # Vectorized G over (x, y)
-G_vmap = jit(vmap(G, in_axes=(None, None, None, 0, 0, 0, None), out_axes=0))
+G_vmap = jit(vmap(G, in_axes=(None, None, 0, 0, 0, None), out_axes=0))
 
 # Precompute G values efficiently
 @jit
-def precompute_G(x_flat, y_flat, x0, y0, t0, kappa, t_current):
-    def single_source_contribution(x, y, x0_i, y0_i, t0_i):
-        return G(t_current, x, y, x0_i, y0_i, t0_i, kappa)
-
-    # Map over all source points (x0, y0, t0)
-    f_CR_total = vmap(single_source_contribution, in_axes=(None, None, 0, 0, 0))(x_flat, y_flat, x0, y0, t0)
-
-    # Sum over all sources
+def precompute_G(x_flat, y_flat, x0, y0, t0, t_current):
+    f_CR_total = vmap(G, in_axes=(None, None, 0, 0, 0, None))(x_flat, y_flat, x0, y0, t0, t_current)
     return jnp.sum(f_CR_total, axis=0).reshape(grid_size, grid_size)
 
 # Compute precomputed G values
 t_current = t_max
-G_precomputed = precompute_G(x_flat, y_flat, x0, y0, t0, kappa, t_current)
+f_CR = precompute_G(x_flat, y_flat, x0, y0, t0, t_current)
 
 # JAX-compatible interpolation of G
-def interpolate_G(x_mesh, y_mesh, x_grid, y_grid, G_precomputed):
+def interpolate_G(x_mesh, y_mesh, x_grid, y_grid, f_CR):
     x_indices = (x_mesh - x_grid[0]) / (x_grid[-1] - x_grid[0]) * (grid_size - 1)
     y_indices = (y_mesh - y_grid[0]) / (y_grid[-1] - y_grid[0]) * (grid_size - 1)
-    return map_coordinates(G_precomputed, [x_indices, y_indices], order=1)
-
-# Efficient interpolation of G
-G_interpolated = interpolate_G(x_mesh, y_mesh, x_grid, y_grid, G_precomputed)
+    x_indices = jnp.clip(x_indices, 0, grid_size - 1)
+    y_indices = jnp.clip(y_indices, 0, grid_size - 1)
+    return map_coordinates(f_CR, [x_indices, y_indices], order=1)
 
 # Plot
 plt.figure(figsize=(8, 6))
-plt.imshow(jnp.log10(jnp.nan_to_num(G_interpolated)).T, origin="lower", extent=[-15, 15, -15, 15], cmap='magma', aspect='auto')
-plt.colorbar(label='$G(x,y)$ interpolated')
+plt.imshow(jnp.log10(jnp.nan_to_num(f_CR)).T, origin="lower",
+           extent=[-R, R, -R, R], cmap='magma', aspect='auto')
+plt.colorbar(label='$\log_{10} f_{CR}(x,y)$')
 plt.xlabel('$x$ (kpc)')
 plt.ylabel('$y$ (kpc)')
-plt.title('Interpolated Green’s Function $G(x,y)$')
+plt.title('Cosmic Ray Density $f_{CR}(x,y)$')
 plt.show()
