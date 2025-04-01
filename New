@@ -1,0 +1,97 @@
+import jax.numpy as jnp
+import jax.random as random
+import matplotlib.pyplot as plt
+from jax import vmap, jit
+from jax.scipy.ndimage import map_coordinates
+import jax
+jax.config.update("jax_enable_x64", True)
+
+# Constants
+R = 15  # kpc
+L = 4   # kpc
+z0 = 0
+kappa = 4.429 * 1e-5
+t_max = 5e4
+N_sources = int(0.03 * t_max)  # Increased number of sources
+
+# Random number generator
+key = random.PRNGKey(0)
+key_theta, key_r, key_t = random.split(key, 3)
+
+# Sample (x0, y0) in a circular disk
+theta = random.uniform(key_theta, (N_sources,), minval=0, maxval=2 * jnp.pi)
+r = R * jnp.sqrt(random.uniform(key_r, (N_sources,)))
+x0 = r * jnp.cos(theta)
+y0 = r * jnp.sin(theta)
+
+# Sample t0 in (0, t_max)
+t0 = random.uniform(key_t, (N_sources,), minval=0, maxval=t_max)
+
+# Grid setup
+grid_size = 150
+x_grid = jnp.linspace(-R, R, grid_size)
+y_grid = jnp.linspace(-R, R, grid_size)
+x_mesh, y_mesh = jnp.meshgrid(x_grid, y_grid, indexing='ij')
+
+# Flatten mesh grids for vectorization
+x_flat = x_mesh.ravel()
+y_flat = y_mesh.ravel()
+
+#Source spectrum function
+def Q(E):
+    alpha = 4.23
+    xi_CR = 8.7 / 100  # Convert percentage to fraction
+    E_SNR = 6.242e62  # in eV, from 10^51 erg
+    m_p_c2 = 0.938e9  # Proton rest energy in eV
+    Lambda = 4.111  # Normalization constant
+    beta = 1  # Given in the problem
+
+    x = E / m_p_c2
+    Q_E = (xi_CR * E_SNR) / ((m_p_c2) ** 2 * Lambda * beta) * (jnp.sqrt(x**2 - 1)) ** (2 - alpha)
+
+    return Q_E
+
+# Green's function G
+@jit
+def G(x, y, x0, y0, t0, t, E):
+    tau = jnp.maximum(t - t0, 1e-6)  # Ensure tau > 0
+    n_values = jnp.arange(-50, 51)
+    zn = 2 * n_values[:, None] * L + (-1) ** n_values[:, None] * z0  # Shape (101, 1)
+
+    # Compute exponent term with broadcasting
+    exponent = -((x - x0) ** 2 + (y - y0) ** 2 + zn ** 2) / (4 * kappa * tau)
+    psi_n = ((-1) ** n_values[:, None] * Q(E) / ((4 * jnp.pi * kappa * tau) ** (3 / 2))) * jnp.exp(exponent)
+
+    return jnp.sum(psi_n, axis=0)  # Sum over `n` to collapse dimension
+
+# Vectorized G over (x, y)
+G_vmap = jit(vmap(G, in_axes=(None, None, 0, 0, 0, None, None), out_axes=0))
+
+# Precompute G values efficiently
+@jit
+def precompute_G(x_flat, y_flat, x0, y0, t0, t_current, E):
+    f_CR_total = vmap(G, in_axes=(None, None, 0, 0, 0, None, None))(
+        x_flat, y_flat, x0, y0, t0, t_current, E)
+    return jnp.sum(f_CR_total, axis=0).reshape(grid_size, grid_size)
+
+# Compute precomputed G values
+t_current = t_max
+E_current = 1e15
+f_CR = precompute_G(x_flat, y_flat, x0, y0, t0, t_current, E_current)
+
+# JAX-compatible interpolation of G
+def interpolate_G(x_mesh, y_mesh, x_grid, y_grid, f_CR):
+    x_indices = (x_mesh - x_grid[0]) / (x_grid[-1] - x_grid[0]) * (grid_size - 1)
+    y_indices = (y_mesh - y_grid[0]) / (y_grid[-1] - y_grid[0]) * (grid_size - 1)
+    x_indices = jnp.clip(x_indices, 0, grid_size - 1)
+    y_indices = jnp.clip(y_indices, 0, grid_size - 1)
+    return map_coordinates(f_CR, [x_indices, y_indices], order=1)
+
+# Plot
+plt.figure(figsize=(8, 6))
+plt.imshow(jnp.log10(jnp.nan_to_num(f_CR)).T, origin="lower", extent=[-R, R, -R, R], cmap='magma', aspect='auto')
+plt.colorbar(label='$\log_{10} f_{CR}(x,y)$')
+plt.xlabel('$x$ (kpc)')
+plt.ylabel('$y$ (kpc)')
+plt.title('Cosmic Ray Density $f_{CR}(x,y)$')
+plt.show()
